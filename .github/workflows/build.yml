@@ -1,0 +1,63 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO and esptool
+        run: pip install platformio 'esptool<5'
+
+      - name: Build
+        run: pio run -e esp32c3
+
+      - name: Package binaries
+        run: |
+          B=.pio/build/esp32c3
+          mkdir dist
+          cp $B/firmware.bin dist/ntp-gps-module-app.bin
+          esptool.py --chip esp32c3 merge_bin -o dist/ntp-gps-module-factory.bin \
+            0x0     $B/bootloader.bin \
+            0x8000  $B/partitions.bin \
+            0xe000  ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 $B/firmware.bin
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/*.bin
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.bin \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+            --notes-file - <<'NOTES'
+          **ntp-gps-module-factory.bin** – complete image, flash at offset 0x0:
+          `esptool.py --chip esp32c3 write_flash 0x0 ntp-gps-module-factory.bin`
+
+          **ntp-gps-module-app.bin** – application only, flash at 0x10000 to update an existing install.
+          NOTES
