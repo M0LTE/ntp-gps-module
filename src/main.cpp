@@ -302,8 +302,10 @@ static void applyFilter() {
   }
 
   if (!everSynced || off > STEP_THRESHOLD_US || off < -STEP_THRESHOLD_US) {
-    struct timeval zero = {0, 0};
-    adjtime(&zero, nullptr);  // cancel any slew in progress before stepping
+    // Cancel any slew in progress; the part that never ran was not applied.
+    struct timeval zero = {0, 0}, left = {0, 0};
+    adjtime(&zero, &left);
+    if (everSynced) totalAppliedUs -= (int64_t)left.tv_sec * 1000000LL + left.tv_usec;
     int64_t t = nowUs() + off;
     struct timeval tv = {(time_t)(t / 1000000), (suseconds_t)(t % 1000000)};
     settimeofday(&tv, nullptr);
@@ -514,7 +516,7 @@ static void handleSave() {
   server.send(200, "text/html", p);
 
   if (ntpChanged) { needIburst = true; lastPollMs = 0; lastNtpIp = IPAddress(); }
-  if (wifiChanged) { delay(500); connectSta(); }
+  if ((wifiChanged || WiFi.status() != WL_CONNECTED) && !cfgSsid.isEmpty()) { delay(500); connectSta(); }
 }
 
 static void handleScan() {
@@ -595,9 +597,12 @@ void loop() {
   } else {
     if (staConnectedSince) Serial.println("Wi-Fi lost, holding time on the crystal");
     staConnectedSince = 0;
-    // Keep trying to rejoin. The setup AP is only for first setup and the BOOT
-    // button: running it alongside makes rejoining unreliable.
-    if (!apActive && !cfgSsid.isEmpty() && now - staLastAttempt > STA_RETRY_MS) connectSta();
+    // Keep trying to rejoin. The setup AP is not opened for an outage, only for
+    // first setup and the BOOT button: running it alongside hampers rejoining.
+    // While the AP is up, only retry when nobody is using it (joining hops channels).
+    if (!cfgSsid.isEmpty() && now - staLastAttempt > STA_RETRY_MS &&
+        (!apActive || WiFi.softAPgetStationNum() == 0))
+      connectSta();
   }
 
   applyRate();
