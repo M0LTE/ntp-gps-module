@@ -19,6 +19,7 @@
 #include <Preferences.h>
 #include <sys/time.h>
 #include <driver/gpio.h>
+#include <esp_timer.h>
 
 // ---- Pins -------------------------------------------------------------------
 static const int NMEA_TX_PIN = 4;   // -> clock GPS data (PD0 / RXD)
@@ -34,7 +35,11 @@ static const int IBURST_SAMPLES = 4;
 static const int FILTER_SIZE = 4;
 static const int64_t STEP_THRESHOLD_US = 128000;
 static const uint32_t STALE_AFTER_MS = 60UL * 60 * 1000;  // report 'V' after 1h without sync
-static const uint32_t STA_CONNECT_TIMEOUT_MS = 30000;
+static const uint32_t STA_RETRY_MS = 60000;               // rejoin attempt interval while offline
+static const uint32_t RESYNC_AFTER_MS = 5 * POLL_INTERVAL_MS;  // longer gap: discard old samples
+static const int64_t RATE_WINDOW_US = 6LL * 3600 * 1000000;   // learn the crystal rate over 6 h
+static const int64_t RATE_MIN_SPAN_US = 30LL * 60 * 1000000;  // need 30 min before trusting it
+static const int RATE_POINTS = 400;                           // > 6 h of 64 s polls
 static const uint32_t AP_OFF_AFTER_CONNECT_MS = 120000;
 
 // ---- State ------------------------------------------------------------------
@@ -46,7 +51,7 @@ static WiFiUDP udp;
 static String cfgSsid, cfgPass, cfgNtp;
 static bool apActive = false;
 static uint32_t staConnectedSince = 0;
-static uint32_t staLostSince = 0;
+static uint32_t staLastAttempt = 0;
 static String apSsid;
 static String scanOptions;
 
@@ -145,11 +150,24 @@ struct NtpSample {
   int64_t offsetUs;
   int64_t delayUs;
   int64_t appliedAtSample;  // value of totalAppliedUs when the sample was taken
+  int64_t monoUs;           // esp_timer time of the sample (crystal time, never adjusted)
 };
 
 static NtpSample filter[FILTER_SIZE];
 static int filterCount = 0, filterHead = 0;
+// Every correction made to the clock since the first sync (slews, steps and
+// rate corrections). totalAppliedUs + a sample's offset is how far the
+// uncorrected crystal has wandered by then; its slope is the crystal's rate error.
 static int64_t totalAppliedUs = 0;
+
+struct RatePoint { int64_t monoUs, errUs; };
+static RatePoint ratePts[RATE_POINTS];
+static int rateHead = 0, rateCount = 0;
+static double ratePpm = 0;        // positive: crystal runs slow, so we add time
+static bool rateLearnt = false;   // estimated from this boot's samples
+static int rateSpanMin = 0;
+static double savedRatePpm = 0;
+static uint32_t rateSavedMs = 0;
 static uint32_t lastPollMs = 0;
 static bool needIburst = true;
 
@@ -188,10 +206,82 @@ static bool ntpQuery(const IPAddress &ip, NtpSample &out) {
   out.offsetUs = ((t2 - t1) + (t3 - t4)) / 2;
   out.delayUs = (t4 - t1) - (t3 - t2);
   out.appliedAtSample = totalAppliedUs;
+  out.monoUs = esp_timer_get_time();
   return true;
 }
 
 static void clearFilter() { filterCount = 0; filterHead = 0; }
+
+// adjtime() replaces any slew still in progress, so add to what is left of it.
+static void addSlew(int64_t us) {
+  struct timeval left = {0, 0};
+  adjtime(nullptr, &left);
+  int64_t total = (int64_t)left.tv_sec * 1000000LL + left.tv_usec + us;
+  struct timeval tv = {(time_t)(total / 1000000), (suseconds_t)(total % 1000000)};
+  adjtime(&tv, nullptr);  // slews at 1/64, so <= 128 ms finishes in ~8 s
+  totalAppliedUs += us;
+}
+
+static void saveRate() {
+  prefs.begin("ntpgps", false);
+  prefs.putFloat("rate", (float)ratePpm);
+  prefs.end();
+  savedRatePpm = ratePpm;
+  rateSavedMs = millis();
+}
+
+// Least-squares slope of the crystal's accumulated error over the last 6 h.
+static void updateRate(const NtpSample &s) {
+  int last = (rateHead + RATE_POINTS - 1) % RATE_POINTS;
+  if (rateCount && s.monoUs <= ratePts[last].monoUs) return;  // sample already used
+  ratePts[rateHead] = {s.monoUs, s.appliedAtSample + s.offsetUs};
+  rateHead = (rateHead + 1) % RATE_POINTS;
+  if (rateCount < RATE_POINTS) rateCount++;
+  while (rateCount > 1 &&
+         s.monoUs - ratePts[(rateHead + RATE_POINTS - rateCount) % RATE_POINTS].monoUs > RATE_WINDOW_US)
+    rateCount--;
+
+  const RatePoint &first = ratePts[(rateHead + RATE_POINTS - rateCount) % RATE_POINTS];
+  int64_t span = s.monoUs - first.monoUs;
+  if (span < RATE_MIN_SPAN_US) return;  // keep the previous (or saved) estimate
+
+  double n = 0, mx = 0, my = 0;
+  for (int i = 0; i < rateCount; i++) {
+    const RatePoint &p = ratePts[(rateHead + RATE_POINTS - rateCount + i) % RATE_POINTS];
+    mx += (double)(p.monoUs - first.monoUs);
+    my += (double)(p.errUs - first.errUs);
+    n++;
+  }
+  mx /= n; my /= n;
+  double sxy = 0, sxx = 0;
+  for (int i = 0; i < rateCount; i++) {
+    const RatePoint &p = ratePts[(rateHead + RATE_POINTS - rateCount + i) % RATE_POINTS];
+    double x = (double)(p.monoUs - first.monoUs) - mx, y = (double)(p.errUs - first.errUs) - my;
+    sxy += x * y;
+    sxx += x * x;
+  }
+  if (sxx <= 0) return;
+  double ppm = sxy / sxx * 1e6;
+  if (ppm > 500 || ppm < -500) return;  // nonsense; a real crystal is within ~50 ppm
+  ratePpm = ppm;
+  rateLearnt = true;
+  rateSpanMin = (int)(span / 60000000);
+  if (fabs(ratePpm - savedRatePpm) > 0.2 && millis() - rateSavedMs > 3600000UL) saveRate();
+}
+
+// Called from loop(): feed in the crystal rate correction a little at a time,
+// so the clock keeps good time between polls and through Wi-Fi outages.
+static void applyRate() {
+  static int64_t lastMono = 0;
+  static double pendingUs = 0;
+  int64_t mono = esp_timer_get_time();
+  if (!everSynced) { lastMono = mono; pendingUs = 0; return; }
+  if (mono - lastMono < 1000000) return;
+  pendingUs += ratePpm * (double)(mono - lastMono) / 1e6;
+  lastMono = mono;
+  int64_t us = (int64_t)pendingUs;
+  if (us) { pendingUs -= (double)us; addSlew(us); }
+}
 
 static void applyFilter() {
   // Pick the minimum-delay sample; correct its offset for adjustments made since.
@@ -204,17 +294,25 @@ static void applyFilter() {
   lastOffsetUs = off;
   lastDelayUs = filter[best].delayUs;
 
+  if (!everSynced) {
+    totalAppliedUs = 0;  // the first step is from 1970, not crystal error
+    rateCount = rateHead = 0;
+  } else {
+    updateRate(filter[best]);
+  }
+
   if (!everSynced || off > STEP_THRESHOLD_US || off < -STEP_THRESHOLD_US) {
+    struct timeval zero = {0, 0};
+    adjtime(&zero, nullptr);  // cancel any slew in progress before stepping
     int64_t t = nowUs() + off;
     struct timeval tv = {(time_t)(t / 1000000), (suseconds_t)(t % 1000000)};
     settimeofday(&tv, nullptr);
+    if (everSynced) totalAppliedUs += off;
     clearFilter();
     Serial.printf("NTP: stepped clock by %lld us\n", off);
   } else {
-    struct timeval tv = {(time_t)(off / 1000000), (suseconds_t)(off % 1000000)};
-    adjtime(&tv, nullptr);  // slews at 1/64, so <= 128 ms finishes in ~8 s
-    totalAppliedUs += off;
-    Serial.printf("NTP: slewing %lld us (delay %lld us)\n", off, lastDelayUs);
+    addSlew(off);
+    Serial.printf("NTP: slewing %lld us (delay %lld us, rate %+.2f ppm)\n", off, lastDelayUs, ratePpm);
   }
   everSynced = true;
   lastSyncMs = millis();
@@ -224,6 +322,13 @@ static void ntpPoll() {
   IPAddress ip;
   if (!WiFi.hostByName(cfgNtp.c_str(), ip)) { lastNtpError = "DNS lookup failed"; return; }
   lastNtpIp = ip;
+
+  // After a long gap (Wi-Fi outage) the old samples describe the clock as it
+  // was before; they would mask the error that built up. Start afresh.
+  if (everSynced && millis() - lastSyncMs > RESYNC_AFTER_MS) {
+    clearFilter();
+    needIburst = true;
+  }
 
   int samples = needIburst ? IBURST_SAMPLES : 1;
   int got = 0;
@@ -250,7 +355,9 @@ static void loadConfig() {
   cfgSsid = prefs.getString("ssid", "");
   cfgPass = prefs.getString("pass", "");
   cfgNtp = prefs.getString("ntp", DEFAULT_NTP);
+  ratePpm = savedRatePpm = prefs.getFloat("rate", 0);
   prefs.end();
+  rateSavedMs = millis();
   if (cfgNtp.isEmpty()) cfgNtp = DEFAULT_NTP;
 }
 
@@ -314,7 +421,7 @@ static void connectSta() {
   WiFi.disconnect();
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  staLostSince = millis();
+  staLastAttempt = millis();
   staConnectedSince = 0;
   Serial.printf("Joining '%s'\n", cfgSsid.c_str());
 }
@@ -352,6 +459,8 @@ static String statusTable() {
     s += "<span class=bad>never</span>";
   }
   if (!lastNtpError.isEmpty()) s += "<br>last poll: " + htmlEscape(lastNtpError);
+  s += "</td></tr><tr><td>Crystal rate</td><td>" + String(ratePpm, 2) + " ppm, " +
+       (rateLearnt ? String("learnt over ") + String(rateSpanMin) + " min" : String("saved estimate, still learning"));
   s += "</td></tr><tr><td>UTC</td><td>";
   if (everSynced) {
     time_t t = time(nullptr);
@@ -476,18 +585,22 @@ void loop() {
       Serial.printf("Connected, IP %s\n", WiFi.localIP().toString().c_str());
       MDNS.end();
       if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
+      lastPollMs = 0;  // poll straight away after (re)joining
     }
-    staLostSince = 0;
     if (apActive && now - staConnectedSince > AP_OFF_AFTER_CONNECT_MS) stopAp();
     if (!lastPollMs || now - lastPollMs >= POLL_INTERVAL_MS) {
       lastPollMs = now;
       ntpPoll();
     }
   } else {
+    if (staConnectedSince) Serial.println("Wi-Fi lost, holding time on the crystal");
     staConnectedSince = 0;
-    if (!staLostSince) staLostSince = now;
-    if (!apActive && now - staLostSince > STA_CONNECT_TIMEOUT_MS) startAp();
+    // Keep trying to rejoin. The setup AP is only for first setup and the BOOT
+    // button: running it alongside makes rejoining unreliable.
+    if (!apActive && !cfgSsid.isEmpty() && now - staLastAttempt > STA_RETRY_MS) connectSta();
   }
+
+  applyRate();
 
   // Hold BOOT for 3 s to bring the setup AP back.
   static uint32_t btnDown = 0;
